@@ -1,0 +1,16 @@
+# Ignore everything
+*
+
+# But keep this .gitignore
+!.gitignore
+
+# Keep markdown and Python files in current folder
+!/*.md
+!/*.py
+
+# Keep the Parallel_Computing folder itself
+!Parallel_Computing/
+
+# Keep markdown and Python files inside Parallel_Computing and its subfolders
+!Parallel_Computing/**/*.md
+!Parallel_Computing/**/*.py

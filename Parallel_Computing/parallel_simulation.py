@@ -1,5 +1,7 @@
 import os
 import sys
+import time
+import sqlite3
 import argparse
 import traceback
 from pathlib import Path
@@ -27,17 +29,17 @@ DEFAULT_EVENTS_SUM_FOLDER = (
 
 DEFAULT_BOUND_CACHE_PATH = (
     "/das/work/units/maloja/p21108/Hankai/Simulation/xraypac/xatom/"
-    "Simulation/I_Dynamics/15fs_EventDyn/Cache/bound_transition_cache.sqlite"
+    "Simulation/I_Dynamics/15fs_EventDyn/Cache/540eV/bound_transition_cache.sqlite"
 )
 
 DEFAULT_DECAY_CACHE_PATH = (
     "/das/work/units/maloja/p21108/Hankai/Simulation/xraypac/xatom/"
-    "Simulation/I_Dynamics/15fs_EventDyn/Cache/decay_lifetime_cache.sqlite"
+    "Simulation/I_Dynamics/15fs_EventDyn/Cache/540eV/decay_lifetime_cache.sqlite"
 )
 
 DEFAULT_NONRES_CACHE_PATH = (
     "/das/work/units/maloja/p21108/Hankai/Simulation/xraypac/xatom/"
-    "Simulation/I_Dynamics/15fs_EventDyn/Cache/nonres_fpp_cache.sqlite"
+    "Simulation/I_Dynamics/15fs_EventDyn/Cache/540eV/nonres_fpp_cache.sqlite"
 )
 
 
@@ -46,16 +48,6 @@ DEFAULT_NONRES_CACHE_PATH = (
 # ============================================================
 
 def load_unique_configs(events_sum_folder, photonE):
-    """
-    Load all unique electronic configurations for one photon energy.
-
-    Expected input file:
-        results_15fs_{photonE}eV.npz
-
-    Expected key inside the npz:
-        Current_Nodes
-    """
-
     npz_file = os.path.join(
         events_sum_folder,
         f"results_15fs_{int(photonE)}eV.npz"
@@ -73,20 +65,12 @@ def load_unique_configs(events_sum_folder, photonE):
         )
 
     unique_configs = np.unique(data["Current_Nodes"])
-
-    # Convert possible numpy string/object types to normal Python strings
     unique_configs = [str(config) for config in unique_configs]
 
     return unique_configs
 
 
 def load_finished_configs(output_file):
-    """
-    Read already-finished configs from the output file.
-
-    This allows the job to resume if it was interrupted.
-    """
-
     finished = set()
 
     if not os.path.exists(output_file):
@@ -112,31 +96,66 @@ def load_finished_configs(output_file):
 
 
 def initialize_output_file(output_file):
-    """
-    Create output file and write header if the file does not exist.
-    """
-
     if not os.path.exists(output_file):
         with open(output_file, "w") as f:
             f.write("config\tf0\tfp\tfpp\n")
 
 
 def initialize_error_file(error_file):
-    """
-    Create error file and write header if the file does not exist.
-    """
-
     if not os.path.exists(error_file):
         with open(error_file, "w") as f:
             f.write("config\terror_type\terror_message\ttraceback\n")
 
 
 def safe_one_line(text):
+    return str(text).replace("\n", "\\n").replace("\t", "    ")
+
+
+def calculate_formfac_with_retry(
+    cfx,
+    config,
+    photonE,
+    chunk_temp_storage_folder,
+    bound_cache_path,
+    decay_cache_path,
+    nonres_cache_path,
+    max_retries=10,
+    wait_seconds=30,
+):
     """
-    Convert error messages / tracebacks into one-line text for TSV output.
+    Retry only temporary SQLite 'database is locked' errors.
+    Other errors are raised immediately.
     """
 
-    return str(text).replace("\n", "\\n").replace("\t", "    ")
+    for attempt in range(max_retries + 1):
+        try:
+            return cfx.calculate_formfac(
+                config,
+                photonE,
+                temp_storage_folder=chunk_temp_storage_folder,
+                bound_cache_db_path=bound_cache_path,
+                decay_cache_db_path=decay_cache_path,
+                nonres_cache_db_path=nonres_cache_path,
+            )
+
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+
+            if "database is locked" not in message:
+                raise
+
+            if attempt >= max_retries:
+                raise
+
+            sleep_time = wait_seconds * (attempt + 1)
+
+            print(
+                f"[SQL LOCK] database is locked. "
+                f"Retry {attempt + 1}/{max_retries} after {sleep_time} s.",
+                flush=True,
+            )
+
+            time.sleep(sleep_time)
 
 
 # ============================================================
@@ -151,6 +170,20 @@ def main():
         type=float,
         required=True,
         help="Photon energy in eV."
+    )
+
+    parser.add_argument(
+        "--chunk_id",
+        type=int,
+        default=0,
+        help="Chunk index."
+    )
+
+    parser.add_argument(
+        "--n_chunks",
+        type=int,
+        default=10,
+        help="Total number of chunks."
     )
 
     parser.add_argument(
@@ -171,7 +204,7 @@ def main():
         "--events_sum_folder",
         type=str,
         default=DEFAULT_EVENTS_SUM_FOLDER,
-        help="Folder containing results_15fs_{photonE}eV.npz files."
+        help="Folder containing results_15fs_<photonE>eV.npz files."
     )
 
     parser.add_argument(
@@ -198,6 +231,18 @@ def main():
     args = parser.parse_args()
 
     photonE = args.photonE
+    chunk_id = args.chunk_id
+    n_chunks = args.n_chunks
+
+    if n_chunks < 1:
+        raise ValueError(f"n_chunks must be >= 1, got {n_chunks}")
+
+    if chunk_id < 0 or chunk_id >= n_chunks:
+        raise ValueError(
+            f"chunk_id must satisfy 0 <= chunk_id < n_chunks. "
+            f"Got chunk_id={chunk_id}, n_chunks={n_chunks}"
+        )
+
     work_dir = args.work_dir
     config_files_folder = args.config_files_folder
     events_sum_folder = args.events_sum_folder
@@ -206,18 +251,18 @@ def main():
     decay_cache_path = args.decay_cache_path
     nonres_cache_path = args.nonres_cache_path
 
-    # Make sure Python can find calculate_formfac_xatom.py
     sys.path.append(work_dir)
 
     import calculate_formfac_xatom as cfx
 
-    # Make sure SQL cache folders exist
     Path(bound_cache_path).parent.mkdir(parents=True, exist_ok=True)
     Path(decay_cache_path).parent.mkdir(parents=True, exist_ok=True)
     Path(nonres_cache_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # Output folder for this photon energy.
-    # Permanent output files are saved in integer folders such as 540eV.
+    # ============================================================
+    # Permanent output folder
+    # ============================================================
+
     photonE_folder = os.path.join(
         config_files_folder,
         f"{int(photonE)}eV"
@@ -227,27 +272,58 @@ def main():
 
     output_file = os.path.join(
         photonE_folder,
-        f"formfac_{int(photonE)}eV.txt"
+        f"formfac_{int(photonE)}eV_chunk_{chunk_id:03d}.txt"
     )
 
     error_file = os.path.join(
         photonE_folder,
-        f"formfac_{int(photonE)}eV_errors.txt"
+        f"formfac_{int(photonE)}eV_chunk_{chunk_id:03d}_errors.txt"
     )
 
     initialize_output_file(output_file)
     initialize_error_file(error_file)
 
-    unique_configs = load_unique_configs(events_sum_folder, photonE)
+    # ============================================================
+    # Private temporary XATOM folder for this chunk
+    # ============================================================
 
+    chunk_temp_storage_folder = os.path.join(
+        config_files_folder,
+        f"{int(photonE)}eV",
+        f"Temp_chunk_{int(photonE)}eV_{chunk_id:03d}"
+    )
+
+    Path(chunk_temp_storage_folder).mkdir(parents=True, exist_ok=True)
+
+    # ============================================================
+    # Load configs and split by chunk
+    # ============================================================
+
+    all_unique_configs = load_unique_configs(events_sum_folder, photonE)
+    unique_configs = all_unique_configs[chunk_id::n_chunks]
+
+    # Skip successful configs from this chunk output.
     finished_configs = load_finished_configs(output_file)
+
+    # Also skip successful configs from old full non-chunk output.
+    old_full_output_file = os.path.join(
+        photonE_folder,
+        f"formfac_{int(photonE)}eV.txt"
+    )
+
+    old_finished_configs = load_finished_configs(old_full_output_file)
+    finished_configs = finished_configs.union(old_finished_configs)
 
     print("=" * 120, flush=True)
     print(f"Photon energy: {photonE} eV", flush=True)
-    print(f"Number of unique configs: {len(unique_configs)}", flush=True)
-    print(f"Already finished configs: {len(finished_configs)}", flush=True)
+    print(f"Chunk: {chunk_id}/{n_chunks}", flush=True)
+    print(f"Total unique configs before chunking: {len(all_unique_configs)}", flush=True)
+    print(f"Configs in this chunk: {len(unique_configs)}", flush=True)
+    print(f"Already finished configs relevant to this chunk: {len(finished_configs)}", flush=True)
+    print(f"Chunk temporary XATOM folder: {chunk_temp_storage_folder}", flush=True)
     print(f"Output file: {output_file}", flush=True)
     print(f"Error file: {error_file}", flush=True)
+    print(f"Old full output file used for skipping: {old_full_output_file}", flush=True)
     print(f"Bound cache path: {bound_cache_path}", flush=True)
     print(f"Decay cache path: {decay_cache_path}", flush=True)
     print(f"Nonres cache path: {nonres_cache_path}", flush=True)
@@ -262,14 +338,21 @@ def main():
             n_skipped += 1
             continue
 
+        print(
+            f"[START] {i + 1}/{len(unique_configs)} | "
+            f"photonE={photonE}, chunk={chunk_id}/{n_chunks}",
+            flush=True,
+        )
+
         try:
-            f0, fp, fpp = cfx.calculate_formfac(
-                config,
-                photonE,
-                temp_storage_folder=config_files_folder,
-                bound_cache_db_path=bound_cache_path,
-                decay_cache_db_path=decay_cache_path,
-                nonres_cache_db_path=nonres_cache_path,
+            f0, fp, fpp = calculate_formfac_with_retry(
+                cfx=cfx,
+                config=config,
+                photonE=photonE,
+                chunk_temp_storage_folder=chunk_temp_storage_folder,
+                bound_cache_path=bound_cache_path,
+                decay_cache_path=decay_cache_path,
+                nonres_cache_path=nonres_cache_path,
             )
 
             with open(output_file, "a") as f:
@@ -281,11 +364,13 @@ def main():
                 )
 
             n_success += 1
+            finished_configs.add(config)
 
             print(
                 f"[OK] {i + 1}/{len(unique_configs)} | "
+                f"chunk={chunk_id}/{n_chunks}, "
                 f"success={n_success}, failed={n_failed}, skipped={n_skipped}",
-                flush=True
+                flush=True,
             )
 
         except Exception as exc:
@@ -303,18 +388,21 @@ def main():
 
             print(
                 f"[FAILED] {i + 1}/{len(unique_configs)} | "
+                f"chunk={chunk_id}/{n_chunks}, "
                 f"{type(exc).__name__}: {exc}",
-                flush=True
+                flush=True,
             )
 
     print("=" * 120, flush=True)
     print("Finished", flush=True)
     print(f"Photon energy: {photonE} eV", flush=True)
+    print(f"Chunk: {chunk_id}/{n_chunks}", flush=True)
     print(f"Success: {n_success}", flush=True)
     print(f"Failed: {n_failed}", flush=True)
     print(f"Skipped existing: {n_skipped}", flush=True)
     print(f"Output file: {output_file}", flush=True)
     print(f"Error file: {error_file}", flush=True)
+    print(f"Chunk temporary XATOM folder: {chunk_temp_storage_folder}", flush=True)
     print(f"Bound cache path: {bound_cache_path}", flush=True)
     print(f"Decay cache path: {decay_cache_path}", flush=True)
     print(f"Nonres cache path: {nonres_cache_path}", flush=True)

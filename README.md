@@ -109,3 +109,10 @@ This makes interrupted calculations restartable, because already-finished config
 Notes
 
 This repository is mainly a research workflow for XATOM-based resonant form-factor calculations. Large generated files, temporary XATOM outputs, SQLite caches, and result folders should usually be excluded from Git tracking.
+
+
+# Clear the locks on sqlite in terminal
+for db in /das/work/units/maloja/p21108/Hankai/Simulation/xraypac/xatom/Simulation/I_Dynamics/15fs_EventDyn/Cache/*eV/*.sqlite; do
+    echo "Clearing locks in $db"
+    sqlite3 "$db" "DELETE FROM cache_locks;"
+done
